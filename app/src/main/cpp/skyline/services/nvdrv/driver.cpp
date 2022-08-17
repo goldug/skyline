@@ -60,6 +60,23 @@ namespace skyline::service::nvdrv {
         return NvResult::FileOperationFailed;
     }
 
+    static PosixResult LogIoctlResult(PosixResult result, u32 ioctl) {
+        switch (result) {
+            case PosixResult::Success:
+            case PosixResult::TryAgain:
+            case PosixResult::Busy:
+            case PosixResult::TimedOut:
+                return result;
+            case PosixResult::NotPermitted:
+            case PosixResult::InvalidArgument:
+            case PosixResult::InappropriateIoctlForDevice:
+            case PosixResult::NotSupported:
+            default:
+                Logger::Warn("IOCTL {} failed: {}", ioctl, static_cast<i32>(result));
+                return result;
+        }
+    }
+
     static NvResult ConvertResult(PosixResult result) {
         switch (result) {
             case PosixResult::Success:
@@ -84,33 +101,30 @@ namespace skyline::service::nvdrv {
     }
 
     NvResult Driver::Ioctl(FileDescriptor fd, IoctlDescriptor cmd, span<u8> buffer) {
-        Logger::Debug("fd: {}, cmd: 0x{:X}, device: {}", fd, cmd.raw, devices.at(fd)->GetName());
-
         try {
             std::shared_lock lock(deviceMutex);
-            return ConvertResult(devices.at(fd)->Ioctl(cmd, buffer));
+            Logger::Debug("fd: {}, cmd: 0x{:X}, device: {}", fd, cmd.raw, devices.at(fd)->GetName());
+            return ConvertResult(LogIoctlResult(devices.at(fd)->Ioctl(cmd, buffer), cmd.raw));
         } catch (const std::out_of_range &) {
             throw exception("Ioctl was called with invalid fd: {}", fd);
         }
     }
 
     NvResult Driver::Ioctl2(FileDescriptor fd, IoctlDescriptor cmd, span<u8> buffer, span<u8> inlineBuffer) {
-        Logger::Debug("fd: {}, cmd: 0x{:X}, device: {}", fd, cmd.raw, devices.at(fd)->GetName());
-
         try {
             std::shared_lock lock(deviceMutex);
-            return ConvertResult(devices.at(fd)->Ioctl2(cmd, buffer, inlineBuffer));
+            Logger::Debug("fd: {}, cmd: 0x{:X}, device: {}", fd, cmd.raw, devices.at(fd)->GetName());
+            return ConvertResult(LogIoctlResult(devices.at(fd)->Ioctl2(cmd, buffer, inlineBuffer), cmd.raw));
         } catch (const std::out_of_range &) {
             throw exception("Ioctl2 was called with invalid fd: {}", fd);
         }
     }
 
     NvResult Driver::Ioctl3(FileDescriptor fd, IoctlDescriptor cmd, span<u8> buffer, span<u8> inlineBuffer) {
-        Logger::Debug("fd: {}, cmd: 0x{:X}, device: {}", fd, cmd.raw, devices.at(fd)->GetName());
-
         try {
             std::shared_lock lock(deviceMutex);
-            return ConvertResult(devices.at(fd)->Ioctl3(cmd, buffer, inlineBuffer));
+            Logger::Debug("fd: {}, cmd: 0x{:X}, device: {}", fd, cmd.raw, devices.at(fd)->GetName());
+            return ConvertResult(LogIoctlResult(devices.at(fd)->Ioctl3(cmd, buffer, inlineBuffer), cmd.raw));
         } catch (const std::out_of_range &) {
             throw exception("Ioctl3 was called with invalid fd: {}", fd);
         }

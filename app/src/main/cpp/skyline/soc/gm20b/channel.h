@@ -4,7 +4,12 @@
 #pragma once
 
 #include <gpu/interconnect/command_executor.h>
+#include "macro/macro_state.h"
 #include "engines/engine.h"
+#include "engines/fermi_2d.h"
+#include "engines/maxwell_dma.h"
+#include "engines/kepler_compute.h"
+#include "engines/inline2memory.h"
 #include "gpfifo.h"
 
 namespace skyline::soc::gm20b {
@@ -21,11 +26,12 @@ namespace skyline::soc::gm20b {
     struct ChannelContext {
         std::shared_ptr<AddressSpaceContext> asCtx;
         gpu::interconnect::CommandExecutor executor;
-        engine::Engine fermi2D;
+        MacroState macroState;
         std::unique_ptr<engine::maxwell3d::Maxwell3D> maxwell3D; //!< TODO: fix this once graphics context is moved into a cpp file
-        engine::Engine maxwellCompute;
-        engine::Engine maxwellDma;
-        engine::Engine keplerMemory;
+        engine::fermi2d::Fermi2D fermi2D;
+        engine::MaxwellDma maxwellDma;
+        engine::KeplerCompute keplerCompute;
+        engine::Inline2Memory inline2Memory;
         ChannelGpfifo gpfifo;
 
         ChannelContext(const DeviceState &state, std::shared_ptr<AddressSpaceContext> asCtx, size_t numEntries);

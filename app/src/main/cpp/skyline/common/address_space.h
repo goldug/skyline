@@ -3,12 +3,15 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
 #include <concepts>
 #include <common.h>
 
 namespace skyline {
     template<typename VaType, size_t AddressSpaceBits>
     concept AddressSpaceValid = std::is_unsigned_v<VaType> && sizeof(VaType) * 8 >= AddressSpaceBits;
+
+    using TranslatedAddressRange = boost::container::small_vector<span<u8>, 1>;
 
     struct EmptyStruct {};
 
@@ -114,37 +117,93 @@ namespace skyline {
         }
 
         /**
-         * @brief Returns a vector of all physical ranges inside of the given virtual range
+         * @return A vector of all physical ranges inside of the given virtual range
          */
-        std::vector<span<u8>> TranslateRange(VaType virt, VaType size);
+        TranslatedAddressRange TranslateRange(VaType virt, VaType size, std::function<void(span<u8>)> cpuAccessCallback = {});
 
-        void Read(u8 *destination, VaType virt, VaType size);
+        void Read(u8 *destination, VaType virt, VaType size, std::function<void(span<u8>)> cpuAccessCallback = {});
 
         template<typename T>
-        void Read(span <T> destination, VaType virt) {
-            Read(reinterpret_cast<u8 *>(destination.data()), virt, destination.size_bytes());
+        void Read(span <T> destination, VaType virt, std::function<void(span<u8>)> cpuAccessCallback = {}) {
+            Read(reinterpret_cast<u8 *>(destination.data()), virt, destination.size_bytes(), cpuAccessCallback);
         }
 
         template<typename T>
-        T Read(VaType virt) {
+        T Read(VaType virt, std::function<void(span<u8>)> cpuAccessCallback = {}) {
             T obj;
-            Read(reinterpret_cast<u8 *>(&obj), virt, sizeof(T));
+            Read(reinterpret_cast<u8 *>(&obj), virt, sizeof(T), cpuAccessCallback);
             return obj;
         }
 
-        void Write(VaType virt, u8 *source, VaType size);
+        /**
+         * @brief Writes contents starting from the virtual address till the end of the span or an unmapped block has been hit or when `function` returns a non-nullopt value
+         * @param function A function that is called on every block where it should return an end offset into the block when it wants to end reading or std::nullopt when it wants to continue reading
+         * @return A span into the supplied container with the contents of the memory region
+         * @note The function will **NOT** be run on any sparse block
+         * @note The function will provide no feedback on if the end has been reached or if there was an early exit
+         */
+        template<typename Function, typename Container>
+        span<u8> ReadTill(Container& destination, VaType virt, Function function, std::function<void(span<u8>)> cpuAccessCallback = {}) {
+            //TRACE_EVENT("containers", "FlatMemoryManager::ReadTill");
+
+            std::scoped_lock lock(this->blockMutex);
+
+            auto successor{std::upper_bound(this->blocks.begin(), this->blocks.end(), virt, [](auto virt, const auto &block) {
+                return virt < block.virt;
+            })};
+
+            auto predecessor{std::prev(successor)};
+
+            auto pointer{destination.data()};
+            auto remainingSize{destination.size()};
+
+            u8 *blockPhys{predecessor->phys + (virt - predecessor->virt)};
+            VaType blockReadSize{std::min(successor->virt - virt, remainingSize)};
+
+            while (remainingSize) {
+                if (predecessor->phys == nullptr) {
+                    return {destination.data(), destination.size() - remainingSize};
+                } else {
+                    if (predecessor->extraInfo.sparseMapped) {
+                        std::memset(pointer, 0, blockReadSize);
+                    } else {
+                        span<u8> cpuBlock{blockPhys, blockReadSize};
+                        if (cpuAccessCallback)
+                            cpuAccessCallback(cpuBlock);
+
+                        auto end{function(cpuBlock)};
+                        std::memcpy(pointer, blockPhys, end ? *end : blockReadSize);
+                        if (end)
+                            return {destination.data(), (destination.size() - remainingSize) + *end};
+                    }
+                }
+
+                pointer += blockReadSize;
+                remainingSize -= blockReadSize;
+
+                if (remainingSize) {
+                    predecessor = successor++;
+                    blockPhys = predecessor->phys;
+                    blockReadSize = std::min(successor->virt - predecessor->virt, remainingSize);
+                }
+            }
+
+            return {destination.data(), destination.size()};
+        }
+
+        void Write(VaType virt, u8 *source, VaType size, std::function<void(span<u8>)> cpuAccessCallback = {});
 
         template<typename T>
-        void Write(VaType virt, span <T> source) {
+        void Write(VaType virt, span<T> source, std::function<void(span<u8>)> cpuAccessCallback = {}) {
             Write(virt, reinterpret_cast<u8 *>(source.data()), source.size_bytes());
         }
 
-        template<typename T>
-        void Write(VaType virt, T source) {
-            Write(virt, reinterpret_cast<u8 *>(&source), sizeof(T));
+        void Write(VaType virt, util::TrivialObject auto source, std::function<void(span<u8>)> cpuAccessCallback = {}) {
+            Write(virt, reinterpret_cast<u8 *>(&source), sizeof(source), cpuAccessCallback);
         }
-    };
 
+        void Copy(VaType dst, VaType src, VaType size, std::function<void(span<u8>)> cpuAccessCallback = {});
+    };
 
     /**
      * @brief FlatMemoryManager specialises FlatAddressSpaceMap to work as an allocator, with an initial, fast linear pass and a subsequent slower pass that iterates until it finds a free block

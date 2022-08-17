@@ -13,13 +13,13 @@ namespace skyline::kernel::type {
     u8 *KProcess::TlsPage::ReserveSlot() {
         if (index == constant::TlsSlots)
             return nullptr;
-        return memory->ptr + (constant::TlsSlotSize * index++);
+        return memory->guest.data() + (constant::TlsSlotSize * index++);
     }
 
     KProcess::KProcess(const DeviceState &state) : memory(state), KSyncObject(state, KType::KProcess) {}
 
     KProcess::~KProcess() {
-        std::lock_guard guard(threadMutex);
+        std::scoped_lock guard{threadMutex};
         disableThreadCreation = true;
         for (const auto &thread : threads)
             thread->Kill(true);
@@ -33,7 +33,7 @@ namespace skyline::kernel::type {
         else
             alreadyKilled.store(true);
 
-        std::lock_guard guard(threadMutex);
+        std::scoped_lock guard{threadMutex};
         if (disableCreation)
             disableThreadCreation = true;
         if (all) {
@@ -46,33 +46,31 @@ namespace skyline::kernel::type {
 
     void KProcess::InitializeHeapTls() {
         constexpr size_t DefaultHeapSize{0x200000};
-        heap = std::make_shared<KPrivateMemory>(state, reinterpret_cast<u8 *>(state.process->memory.heap.address), DefaultHeapSize, memory::Permission{true, true, false}, memory::states::Heap);
+        heap = std::make_shared<KPrivateMemory>(state, span<u8>{state.process->memory.heap.data(), DefaultHeapSize}, memory::Permission{true, true, false}, memory::states::Heap);
         InsertItem(heap); // Insert it into the handle table so GetMemoryObject will contain it
         tlsExceptionContext = AllocateTlsSlot();
     }
 
     u8 *KProcess::AllocateTlsSlot() {
-        std::lock_guard lock(tlsMutex);
+        std::scoped_lock lock{tlsMutex};
         u8 *slot;
-        for (auto &tlsPage: tlsPages)
+        for (auto &tlsPage : tlsPages)
             if ((slot = tlsPage->ReserveSlot()))
                 return slot;
 
-        slot = tlsPages.empty() ? reinterpret_cast<u8 *>(memory.tlsIo.address) : ((*(tlsPages.end() - 1))->memory->ptr + PAGE_SIZE);
-        auto tlsPage{std::make_shared<TlsPage>(std::make_shared<KPrivateMemory>(state, slot, PAGE_SIZE, memory::Permission(true, true, false), memory::states::ThreadLocal))};
+        slot = tlsPages.empty() ? reinterpret_cast<u8 *>(memory.tlsIo.data()) : ((*(tlsPages.end() - 1))->memory->guest.data() + PAGE_SIZE);
+        auto tlsPage{std::make_shared<TlsPage>(std::make_shared<KPrivateMemory>(state, span<u8>{slot, PAGE_SIZE}, memory::Permission(true, true, false), memory::states::ThreadLocal))};
         tlsPages.push_back(tlsPage);
         return tlsPage->ReserveSlot();
     }
 
     std::shared_ptr<KThread> KProcess::CreateThread(void *entry, u64 argument, void *stackTop, std::optional<i8> priority, std::optional<u8> idealCore) {
-        std::lock_guard guard(threadMutex);
+        std::scoped_lock guard{threadMutex};
         if (disableThreadCreation)
             return nullptr;
         if (!stackTop && threads.empty()) { //!< Main thread stack is created by the kernel and owned by the process
-            mainThreadStack = std::make_shared<KPrivateMemory>(state, reinterpret_cast<u8 *>(state.process->memory.stack.address), state.process->npdm.meta.mainThreadStackSize, memory::Permission{true, true, false}, memory::states::Stack);
-            if (mprotect(mainThreadStack->ptr, PAGE_SIZE, PROT_NONE))
-                throw exception("Failed to create guard page for thread stack at 0x{:X}", mainThreadStack->ptr);
-            stackTop = mainThreadStack->ptr + mainThreadStack->size;
+            mainThreadStack = std::make_shared<KPrivateMemory>(state, span<u8>{state.process->memory.stack.data(), state.process->npdm.meta.mainThreadStackSize}, memory::Permission{true, true, false}, memory::states::Stack);
+            stackTop = mainThreadStack->guest.end().base();
         }
         auto thread{NewHandle<KThread>(this, threads.size(), entry, argument, stackTop, priority ? *priority : state.process->npdm.meta.mainThreadPriority, idealCore ? *idealCore : state.process->npdm.meta.idealCore).item};
         threads.push_back(thread);
@@ -90,7 +88,7 @@ namespace skyline::kernel::type {
                     case type::KType::KSharedMemory:
                     case type::KType::KTransferMemory: {
                         auto mem{std::static_pointer_cast<type::KMemory>(object)};
-                        if (mem->IsInside(ptr))
+                        if (mem->guest.contains(ptr))
                             return std::make_optional<KProcess::HandleOut<KMemory>>({mem, constant::BaseHandleIndex + index});
                     }
 
@@ -124,7 +122,7 @@ namespace skyline::kernel::type {
 
         bool isHighestPriority;
         {
-            std::lock_guard lock(owner->waiterMutex);
+            std::scoped_lock lock{owner->waiterMutex, state.thread->waiterMutex}; // We need to lock both mutexes at the same time as we mutate the owner and the current thread, the ordering of locks **must** match MutexUnlock to avoid deadlocks
 
             u32 value{};
             if (__atomic_compare_exchange_n(mutex, &value, tag, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
@@ -155,12 +153,12 @@ namespace skyline::kernel::type {
     void KProcess::MutexUnlock(u32 *mutex) {
         TRACE_EVENT_FMT("kernel", "MutexUnlock 0x{:X}", mutex);
 
-        std::lock_guard lock(state.thread->waiterMutex);
+        std::scoped_lock lock{state.thread->waiterMutex};
         auto &waiters{state.thread->waiters};
         auto nextOwnerIt{std::find_if(waiters.begin(), waiters.end(), [mutex](const std::shared_ptr<KThread> &thread) { return thread->waitKey == mutex; })};
         if (nextOwnerIt != waiters.end()) {
             auto nextOwner{*nextOwnerIt};
-            std::lock_guard nextLock(nextOwner->waiterMutex);
+            std::scoped_lock nextLock{nextOwner->waiterMutex};
             nextOwner->waitThread = std::shared_ptr<KThread>{nullptr};
             nextOwner->waitKey = nullptr;
 
@@ -179,11 +177,10 @@ namespace skyline::kernel::type {
             if (!waiters.empty()) {
                 // If there are threads still waiting on us then try to inherit their priority
                 auto highestPriorityThread{waiters.front()};
-                i8 newPriority, basePriority;
+                i8 newPriority, currentPriority{state.thread->priority.load()};
                 do {
-                    basePriority = state.thread->basePriority.load();
-                    newPriority = std::min(basePriority, highestPriorityThread->priority.load());
-                } while (basePriority != newPriority && state.thread->priority.compare_exchange_strong(basePriority, newPriority));
+                    newPriority = std::min(currentPriority, highestPriorityThread->priority.load());
+                } while (currentPriority != newPriority && !state.thread->priority.compare_exchange_strong(currentPriority, newPriority));
                 state.scheduler->UpdatePriority(state.thread);
             } else {
                 i8 priority, basePriority;
@@ -201,7 +198,7 @@ namespace skyline::kernel::type {
                 do {
                     ownerPriority = nextOwner->priority.load();
                     priority = std::min(ownerPriority, nextWaiter->priority.load());
-                } while (ownerPriority != priority && nextOwner->priority.compare_exchange_strong(ownerPriority, priority));
+                } while (ownerPriority != priority && !nextOwner->priority.compare_exchange_strong(ownerPriority, priority));
 
                 __atomic_store_n(mutex, nextOwner->waitTag | HandleWaitersBit, __ATOMIC_SEQ_CST);
             } else {
@@ -219,7 +216,7 @@ namespace skyline::kernel::type {
         TRACE_EVENT_FMT("kernel", "ConditionalVariableWait 0x{:X} (0x{:X})", key, mutex);
 
         {
-            std::lock_guard lock(syncWaiterMutex);
+            std::scoped_lock lock{syncWaiterMutex};
             auto queue{syncWaiters.equal_range(key)};
             syncWaiters.insert(std::upper_bound(queue.first, queue.second, state.thread->priority.load(), [](const i8 priority, const SyncWaiters::value_type &it) { return it.second->priority > priority; }), {key, state.thread});
 
@@ -259,7 +256,7 @@ namespace skyline::kernel::type {
     void KProcess::ConditionalVariableSignal(u32 *key, i32 amount) {
         TRACE_EVENT_FMT("kernel", "ConditionalVariableSignal 0x{:X}", key);
 
-        std::lock_guard lock(syncWaiterMutex);
+        std::scoped_lock lock{syncWaiterMutex};
         auto queue{syncWaiters.equal_range(key)};
 
         auto it{queue.first};
@@ -270,13 +267,32 @@ namespace skyline::kernel::type {
             __atomic_store_n(key, false, __ATOMIC_SEQ_CST); // We need to update the boolean flag denoting that there are no more threads waiting on this conditional variable
     }
 
-    Result KProcess::WaitForAddress(u32 *address, u32 value, i64 timeout, bool (*arbitrationFunction)(u32 *, u32)) {
+    Result KProcess::WaitForAddress(u32 *address, u32 value, i64 timeout, ArbitrationType type) {
         TRACE_EVENT_FMT("kernel", "WaitForAddress 0x{:X}", address);
 
         {
-            std::lock_guard lock(syncWaiterMutex);
-            if (!arbitrationFunction(address, value)) [[unlikely]]
-                return result::InvalidState;
+            std::scoped_lock lock{syncWaiterMutex};
+
+            switch (type) {
+                case ArbitrationType::WaitIfLessThan:
+                    if (*address >= value) [[unlikely]]
+                        return result::InvalidState;
+                    break;
+
+                case ArbitrationType::DecrementAndWaitIfLessThan: {
+                    u32 userValue{__atomic_load_n(address, __ATOMIC_SEQ_CST)};
+                    do {
+                        if (value <= userValue) [[unlikely]] // We want to explicitly decrement **after** the check
+                            return result::InvalidState;
+                    } while (!__atomic_compare_exchange_n(address, &userValue, userValue - 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+                    break;
+                }
+
+                case ArbitrationType::WaitIfEqual:
+                    if (*address != value) [[unlikely]]
+                        return result::InvalidState;
+                    break;
+            }
 
             auto queue{syncWaiters.equal_range(address)};
             syncWaiters.insert(std::upper_bound(queue.first, queue.second, state.thread->priority.load(), [](const i8 priority, const SyncWaiters::value_type &it) { return it.second->priority > priority; }), {address, state.thread});
@@ -286,7 +302,7 @@ namespace skyline::kernel::type {
 
         if (timeout > 0 && !state.scheduler->TimedWaitSchedule(std::chrono::nanoseconds(timeout))) {
             {
-                std::lock_guard lock(syncWaiterMutex);
+                std::scoped_lock lock{syncWaiterMutex};
                 auto queue{syncWaiters.equal_range(address)};
                 auto iterator{std::find(queue.first, queue.second, SyncWaiters::value_type{address, state.thread})};
                 if (iterator != queue.second)
@@ -305,15 +321,36 @@ namespace skyline::kernel::type {
         return {};
     }
 
-    Result KProcess::SignalToAddress(u32 *address, u32 value, i32 amount, bool(*mutateFunction)(u32 *address, u32 value, u32 waiterCount)) {
+    Result KProcess::SignalToAddress(u32 *address, u32 value, i32 amount, SignalType type) {
         TRACE_EVENT_FMT("kernel", "SignalToAddress 0x{:X}", address);
 
-        std::lock_guard lock(syncWaiterMutex);
+        std::scoped_lock lock{syncWaiterMutex};
         auto queue{syncWaiters.equal_range(address)};
 
-        if (mutateFunction)
-            if (!mutateFunction(address, value, (amount <= 0) ? 0 : std::min(static_cast<u32>(std::distance(queue.first, queue.second) - amount), 0U))) [[unlikely]]
+        if (type != SignalType::Signal) {
+            u32 newValue{value};
+            if (type == SignalType::SignalAndIncrementIfEqual) {
+                newValue++;
+            } else if (type == SignalType::SignalAndModifyBasedOnWaitingThreadCountIfEqual) {
+                if (amount <= 0) {
+                    if (queue.first != queue.second)
+                        newValue -= 2;
+                    else
+                        newValue++;
+                } else {
+                    if (queue.first != queue.second) {
+                        i32 waiterCount{static_cast<i32>(std::distance(queue.first, queue.second))};
+                        if (waiterCount < amount)
+                            newValue--;
+                    } else {
+                        newValue++;
+                    }
+                }
+            }
+
+            if (!__atomic_compare_exchange_n(address, &value, newValue, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) [[unlikely]]
                 return result::InvalidState;
+        }
 
         i32 waiterCount{amount};
         for (auto it{queue.first}; it != queue.second && (amount <= 0 || waiterCount); it = syncWaiters.erase(it), waiterCount--)

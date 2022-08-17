@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright © 2020 Skyline Team and Contributors (https://github.com/skyline-emu/)
 // Copyright © 2005 The Android Open Source Project
-// Copyright © 2019-2020 Ryujinx Team and Contributors
+// Copyright © 2019-2020 Ryujinx Team and Contributors (https://github.com/Ryujinx/)
 
 #include <gpu.h>
 #include <gpu/texture/format.h>
@@ -129,15 +129,14 @@ namespace skyline::service::hosbinder {
         height = height ? height : defaultHeight;
         format = (format != AndroidPixelFormat::None) ? format : defaultFormat;
 
-        if (!buffer->graphicBuffer) {
+        auto &graphicBuffer{buffer->graphicBuffer};
+        if (!graphicBuffer)
             // Horizon OS doesn't ever allocate memory for the buffers on the GraphicBufferProducer end
             // All buffers must be preallocated on the client application and attached to an Android buffer using SetPreallocatedBuffer
             return AndroidStatus::NoMemory;
-        }
-        auto &handle{buffer->graphicBuffer->graphicHandle};
-        auto &surface{handle.surfaces.front()};
-        if (handle.format != format || surface.width != width || surface.height != height || (buffer->graphicBuffer->usage & usage) != usage) {
-            Logger::Warn("Buffer which has been dequeued isn't compatible with the supplied parameters: Dimensions: {}x{}={}x{}, Format: {}={}, Usage: 0x{:X}=0x{:X}", width, height, surface.width, surface.height, ToString(format), ToString(buffer->graphicBuffer->format), usage, buffer->graphicBuffer->usage);
+
+        if (graphicBuffer->format != format || graphicBuffer->width != width || graphicBuffer->height != height || (graphicBuffer->usage & usage) != usage) {
+            Logger::Warn("Buffer which has been dequeued isn't compatible with the supplied parameters: Dimensions: {}x{}={}x{}, Format: {}={}, Usage: 0x{:X}=0x{:X}", width, height, graphicBuffer->width, graphicBuffer->height, ToString(format), ToString(graphicBuffer->format), usage, graphicBuffer->usage);
             // Nintendo doesn't deallocate the slot which was picked in here and reallocate it as a compatible buffer
             // This is related to the comment above, Nintendo only allocates buffers on the client side
             return AndroidStatus::NoInit;
@@ -306,11 +305,12 @@ namespace skyline::service::hosbinder {
                 case AndroidPixelFormat::RGBX8888:
                     format = gpu::format::R8G8B8A8Unorm;
                     break;
-
+                case AndroidPixelFormat::BGRA8888:
+                    format = gpu::format::B8G8R8A8Unorm;
+                    break;
                 case AndroidPixelFormat::RGB565:
                     format = gpu::format::R5G6B5Unorm;
                     break;
-
                 default:
                     throw exception("Unknown format in buffer: '{}' ({})", ToString(handle.format), static_cast<u32>(handle.format));
             }
@@ -343,8 +343,12 @@ namespace skyline::service::hosbinder {
                 throw exception("Legacy 16Bx16 tiled surfaces are not supported");
             }
 
-            gpu::GuestTexture guestTexture(span<u8>(nvMapHandleObj->GetPointer() + surface.offset, surface.size), gpu::texture::Dimensions(surface.width, surface.height), format, tileConfig, gpu::texture::TextureType::e2D);
-            buffer.texture = state.gpu->texture.FindOrCreate(guestTexture).backing;
+            gpu::texture::Dimensions dimensions(surface.width, surface.height);
+            gpu::GuestTexture guestTexture(span<u8>{}, dimensions, format, tileConfig, vk::ImageViewType::e2D);
+            guestTexture.mappings[0] = span<u8>(nvMapHandleObj->GetPointer() + surface.offset, guestTexture.GetLayerStride());
+
+            std::scoped_lock textureLock{state.gpu->texture};
+            buffer.texture = state.gpu->texture.FindOrCreate(guestTexture);
         }
 
         switch (transform) {
@@ -381,19 +385,15 @@ namespace skyline::service::hosbinder {
                 throw exception("Application attempting to perform unknown sticky transformation: {:#b}", static_cast<u32>(stickyTransform));
         }
 
-        fence.Wait(state.soc->host1x);
+        state.gpu->presentation.Present(buffer.texture, isAutoTimestamp ? 0 : timestamp, swapInterval, crop, scalingMode, transform, fence, [this, &buffer] {
+            std::scoped_lock lock(mutex);
 
-        {
-            auto &texture{buffer.texture};
-            std::scoped_lock textureLock(*texture);
-            texture->SynchronizeHost();
-            u64 frameId;
-            state.gpu->presentation.Present(texture, isAutoTimestamp ? 0 : timestamp, swapInterval, crop, scalingMode, transform, frameId);
-        }
+            buffer.state = BufferState::Free;
+            bufferEvent->Signal();
+        });
 
+        buffer.state = BufferState::Queued;
         buffer.frameNumber = ++frameNumber;
-        buffer.state = BufferState::Free;
-        bufferEvent->Signal();
 
         width = defaultWidth;
         height = defaultHeight;
@@ -573,6 +573,9 @@ namespace skyline::service::hosbinder {
             else if (surface.layout == NvSurfaceLayout::Tiled)
                 throw exception("Legacy 16Bx16 tiled surfaces are not supported");
 
+            defaultFormat = graphicBuffer->format;
+            defaultWidth = graphicBuffer->width;
+            defaultHeight = graphicBuffer->height;
             Logger::Debug("#{} - Dimensions: {}x{} [Stride: {}], Format: {}, Layout: {}, {}: {}, Usage: 0x{:X}, NvMap {}: {}, Buffer Start/End: 0x{:X} -> 0x{:X}", slot, surface.width, surface.height, handle.stride, ToString(handle.format), ToString(surface.layout), surface.layout == NvSurfaceLayout::Blocklinear ? "Block Height" : "Pitch", surface.layout == NvSurfaceLayout::Blocklinear ? 1U << surface.blockHeightLog2 : surface.pitch, graphicBuffer->usage, surface.nvmapHandle ? "Handle" : "ID", surface.nvmapHandle ? surface.nvmapHandle : handle.nvmapId, surface.offset, surface.offset + surface.size);
         } else {
             Logger::Debug("#{} - No GraphicBuffer", slot);

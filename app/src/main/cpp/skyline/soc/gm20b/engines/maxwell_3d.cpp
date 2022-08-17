@@ -3,130 +3,35 @@
 // Copyright © 2018-2020 fincs (https://github.com/devkitPro/deko3d)
 
 #include <boost/preprocessor/repeat.hpp>
-#include "maxwell_3d.h"
 #include <soc.h>
+#include "maxwell_3d.h"
 
 namespace skyline::soc::gm20b::engine::maxwell3d {
-    Maxwell3D::Maxwell3D(const DeviceState &state, ChannelContext &channelCtx, gpu::interconnect::CommandExecutor &executor) : Engine(state), macroInterpreter(*this), context(*state.gpu, channelCtx, executor), channelCtx(channelCtx) {
-        ResetRegs();
+    Maxwell3D::Maxwell3D(const DeviceState &state, ChannelContext &channelCtx, MacroState &macroState, gpu::interconnect::CommandExecutor &executor)
+        : MacroEngineBase(macroState),
+          syncpoints(state.soc->host1x.syncpoints),
+          context(*state.gpu, channelCtx, executor),
+          i2m(channelCtx),
+          channelCtx(channelCtx) {
+        executor.AddFlushCallback([this]() { FlushEngineState(); });
+        InitializeRegisters();
     }
 
-    void Maxwell3D::ResetRegs() {
-        registers = {};
+    void Maxwell3D::FlushDeferredDraw() {
+        if (deferredDraw.pending) {
+            deferredDraw.pending = false;
 
-        registers.rasterizerEnable = true;
+            if (deferredDraw.indexed)
+                context.DrawIndexed(deferredDraw.drawCount, deferredDraw.drawFirst, deferredDraw.instanceCount, deferredDraw.drawBaseVertex);
+            else
+                context.Draw(deferredDraw.drawCount, deferredDraw.drawFirst, deferredDraw.instanceCount);
 
-        for (auto &transform : *registers.viewportTransforms) {
-            transform.swizzles.x = type::ViewportTransform::Swizzle::PositiveX;
-            transform.swizzles.y = type::ViewportTransform::Swizzle::PositiveY;
-            transform.swizzles.z = type::ViewportTransform::Swizzle::PositiveZ;
-            transform.swizzles.w = type::ViewportTransform::Swizzle::PositiveW;
+            deferredDraw.instanceCount = 1;
         }
-
-        for (auto &viewport : *registers.viewports) {
-            viewport.depthRangeFar = 1.0f;
-            viewport.depthRangeNear = 0.0f;
-        }
-
-        registers.polygonMode->front = type::PolygonMode::Fill;
-        registers.polygonMode->back = type::PolygonMode::Fill;
-
-        registers.stencilFront->failOp = registers.stencilFront->zFailOp = registers.stencilFront->zPassOp = type::StencilOp::Keep;
-        registers.stencilFront->compare.op = type::CompareOp::Always;
-        registers.stencilFront->compare.mask = 0xFFFFFFFF;
-        registers.stencilFront->writeMask = 0xFFFFFFFF;
-
-        registers.stencilTwoSideEnable = true;
-        registers.stencilBack->failOp = registers.stencilBack->zFailOp = registers.stencilBack->zPassOp = type::StencilOp::Keep;
-        registers.stencilBack->compareOp = type::CompareOp::Always;
-        registers.stencilBackExtra->compareMask = 0xFFFFFFFF;
-        registers.stencilBackExtra->writeMask = 0xFFFFFFFF;
-
-        registers.rtSeparateFragData = true;
-
-        for (auto &attribute : *registers.vertexAttributeState)
-            attribute.fixed = true;
-
-        registers.depthTestFunc = type::CompareOp::Always;
-
-        registers.blendState->colorOp = registers.blendState->alphaOp = type::Blend::Op::Add;
-        registers.blendState->colorSrcFactor = registers.blendState->alphaSrcFactor = type::Blend::Factor::One;
-        registers.blendState->colorDestFactor = registers.blendState->alphaDestFactor = type::Blend::Factor::Zero;
-
-        registers.lineWidthSmooth = 1.0f;
-        registers.lineWidthAliased = 1.0f;
-
-        registers.pointSpriteEnable = true;
-        registers.pointSpriteSize = 1.0f;
-        registers.pointCoordReplace->enable = true;
-
-        registers.frontFace = type::FrontFace::CounterClockwise;
-        registers.cullFace = type::CullFace::Back;
-
-        for (auto &mask : *registers.colorMask)
-            mask.r = mask.g = mask.b = mask.a = 1;
-
-        for (auto &blend : *registers.independentBlend) {
-            blend.colorOp = blend.alphaOp = type::Blend::Op::Add;
-            blend.colorSrcFactor = blend.alphaSrcFactor = type::Blend::Factor::One;
-            blend.colorDestFactor = blend.alphaDestFactor = type::Blend::Factor::Zero;
-        }
-
-        registers.viewportTransformEnable = true;
     }
 
-    void Maxwell3D::CallMethod(u32 method, u32 argument, bool lastCall) {
-        Logger::Debug("Called method in Maxwell 3D: 0x{:X} args: 0x{:X}", method, argument);
-
-        // Methods that are greater than the register size are for macro control
-        if (method >= RegisterCount) [[unlikely]] {
-            // Starting a new macro at index 'method - RegisterCount'
-            if (!(method & 1)) {
-                if (macroInvocation.index != -1) {
-                    // Flush the current macro as we are switching to another one
-                    macroInterpreter.Execute(macroPositions[static_cast<size_t>(macroInvocation.index)], macroInvocation.arguments);
-                    macroInvocation.arguments.clear();
-                }
-
-                // Setup for the new macro index
-                macroInvocation.index = ((method - RegisterCount) >> 1) % macroPositions.size();
-            }
-
-            macroInvocation.arguments.emplace_back(argument);
-
-            // Flush macro after all of the data in the method call has been sent
-            if (lastCall && macroInvocation.index != -1) {
-                macroInterpreter.Execute(macroPositions[static_cast<size_t>(macroInvocation.index)], macroInvocation.arguments);
-                macroInvocation.arguments.clear();
-                macroInvocation.index = -1;
-            }
-
-            // Bail out early
-            return;
-        }
-
-        #define MAXWELL3D_OFFSET(field) (sizeof(typeof(Registers::field)) - sizeof(typeof(*Registers::field))) / sizeof(u32)
-        #define MAXWELL3D_STRUCT_OFFSET(field, member) MAXWELL3D_OFFSET(field) + U32_OFFSET(typeof(*Registers::field), member)
-        #define MAXWELL3D_ARRAY_OFFSET(field, index) MAXWELL3D_OFFSET(field) + ((sizeof(typeof(Registers::field[0])) / sizeof(u32)) * index)
-        #define MAXWELL3D_ARRAY_STRUCT_OFFSET(field, index, member) MAXWELL3D_ARRAY_OFFSET(field, index) + U32_OFFSET(typeof(Registers::field[0]), member)
-        #define MAXWELL3D_ARRAY_STRUCT_STRUCT_OFFSET(field, index, member, submember) MAXWELL3D_ARRAY_STRUCT_OFFSET(field, index, member) + U32_OFFSET(typeof(Registers::field[0].member), submember)
-
-        #define MAXWELL3D_CASE(field, content) case MAXWELL3D_OFFSET(field): { \
-            auto field{util::BitCast<typeof(*registers.field)>(argument)};     \
-            content                                                            \
-            return;                                                            \
-        }
-        #define MAXWELL3D_CASE_BASE(fieldName, fieldAccessor, offset, content) case offset: { \
-            auto fieldName{util::BitCast<typeof(registers.fieldAccessor)>(argument)};         \
-            content                                                                           \
-            return;                                                                           \
-        }
-        #define MAXWELL3D_STRUCT_CASE(field, member, content) MAXWELL3D_CASE_BASE(member, field->member, MAXWELL3D_STRUCT_OFFSET(field, member), content)
-        #define MAXWELL3D_ARRAY_CASE(field, index, content) MAXWELL3D_CASE_BASE(field, field[index], MAXWELL3D_ARRAY_OFFSET(field, index), content)
-        #define MAXWELL3D_ARRAY_STRUCT_CASE(field, index, member, content) MAXWELL3D_CASE_BASE(member, field[index].member, MAXWELL3D_ARRAY_STRUCT_OFFSET(field, index, member), content)
-        #define MAXWELL3D_ARRAY_STRUCT_STRUCT_CASE(field, index, member, submember, content) MAXWELL3D_CASE_BASE(submember, field[index].member.submember, MAXWELL3D_ARRAY_STRUCT_STRUCT_OFFSET(field, index, member, submember), content)
-
-        if (method != MAXWELL3D_STRUCT_OFFSET(mme, shadowRamControl)) {
+    void Maxwell3D::HandleMethod(u32 method, u32 argument) {
+        if (method != ENGINE_STRUCT_OFFSET(mme, shadowRamControl)) {
             if (shadowRegisters.mme->shadowRamControl == type::MmeShadowRamControl::MethodTrack || shadowRegisters.mme->shadowRamControl == type::MmeShadowRamControl::MethodTrackWithFilter)
                 shadowRegisters.raw[method] = argument;
             else if (shadowRegisters.mme->shadowRamControl == type::MmeShadowRamControl::MethodReplay)
@@ -136,63 +41,162 @@ namespace skyline::soc::gm20b::engine::maxwell3d {
         bool redundant{registers.raw[method] == argument};
         registers.raw[method] = argument;
 
+        if (batchConstantBufferUpdate.Active()) {
+            switch (method) {
+                // Add to the batch constant buffer update buffer
+                // Return early here so that any code below can rely on the fact that any cbuf updates will always be the first of a batch
+                #define CBUF_UPDATE_CALLBACKS(z, index, data_)                \
+                ENGINE_STRUCT_ARRAY_CASE(constantBufferUpdate, data, index, { \
+                    batchConstantBufferUpdate.buffer.push_back(data);         \
+                    registers.constantBufferUpdate->offset += 4;              \
+                    return;                                                   \
+                })
+
+                BOOST_PP_REPEAT(16, CBUF_UPDATE_CALLBACKS, 0)
+                #undef CBUF_UPDATE_CALLBACKS
+                default:
+                    // When a method other than constant buffer update is called submit our submit the previously built-up update as a batch
+                    context.ConstantBufferUpdate(batchConstantBufferUpdate.buffer, batchConstantBufferUpdate.Invalidate());
+                    batchConstantBufferUpdate.Reset();
+                    break; // Continue on here to handle the actual method
+            }
+        }
+
+        // See DeferredDrawState comment for full details
+        if (deferredDraw.pending) {
+            switch (method) {
+                ENGINE_CASE(vertexBeginGl, {
+                    if (vertexBeginGl.instanceNext) {
+                        if (deferredDraw.drawTopology != vertexBeginGl.topology && !vertexBeginGl.instanceContinue)
+                            Logger::Warn("Vertex topology changed partway through instanced draw!");
+
+                        deferredDraw.instanceCount++;
+                    } else if (vertexBeginGl.instanceContinue) {
+                        FlushDeferredDraw();
+                        break; // This instanced draw is finished, continue on to handle the actual method
+                    }
+
+                    return;
+                })
+
+                // Can be ignored since we handle drawing in draw{Vertex,Index}Count
+                ENGINE_CASE(vertexEndGl, { return; })
+
+                // Draws here can be ignored since they're just repeats of the original instanced draw
+                ENGINE_CASE(drawVertexCount, {
+                    if (!redundant)
+                        Logger::Warn("Vertex count changed partway through instanced draw!");
+                    return;
+                })
+                ENGINE_CASE(drawIndexCount, {
+                    if (!redundant)
+                        Logger::Warn("Index count changed partway through instanced draw!");
+                    return;
+                })
+
+                // Once we stop calling draw methods flush the current draw since drawing is dependent on the register state not changing
+                default:
+                    FlushDeferredDraw();
+                    break;
+            }
+        }
+
         if (!redundant) {
             switch (method) {
-                MAXWELL3D_STRUCT_CASE(mme, shadowRamControl, {
+                ENGINE_STRUCT_CASE(mme, shadowRamControl, {
                     shadowRegisters.mme->shadowRamControl = shadowRamControl;
                 })
 
                 #define RENDER_TARGET_ARRAY(z, index, data)                               \
-                MAXWELL3D_ARRAY_STRUCT_STRUCT_CASE(renderTargets, index, address, high, { \
-                    context.SetRenderTargetAddressHigh(index, high);                      \
+                ENGINE_ARRAY_STRUCT_STRUCT_CASE(renderTargets, index, address, high, {    \
+                    context.SetColorRenderTargetAddressHigh(index, high);                 \
                 })                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_STRUCT_CASE(renderTargets, index, address, low, {  \
-                    context.SetRenderTargetAddressLow(index, low);                        \
+                ENGINE_ARRAY_STRUCT_STRUCT_CASE(renderTargets, index, address, low, {     \
+                    context.SetColorRenderTargetAddressLow(index, low);                   \
                 })                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_CASE(renderTargets, index, width, {                \
-                    context.SetRenderTargetWidth(index, width);                           \
+                ENGINE_ARRAY_STRUCT_CASE(renderTargets, index, width, {                   \
+                    context.SetColorRenderTargetWidth(index, width);                      \
                 })                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_CASE(renderTargets, index, height, {               \
-                    context.SetRenderTargetHeight(index, height);                         \
+                ENGINE_ARRAY_STRUCT_CASE(renderTargets, index, height, {                  \
+                    context.SetColorRenderTargetHeight(index, height);                    \
                 })                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_CASE(renderTargets, index, format, {               \
-                    context.SetRenderTargetFormat(index, format);                         \
+                ENGINE_ARRAY_STRUCT_CASE(renderTargets, index, format, {                  \
+                    context.SetColorRenderTargetFormat(index, format);                    \
                 })                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_CASE(renderTargets, index, tileMode, {             \
-                    context.SetRenderTargetTileMode(index, tileMode);                     \
+                ENGINE_ARRAY_STRUCT_CASE(renderTargets, index, tileMode, {                \
+                    context.SetColorRenderTargetTileMode(index, tileMode);                \
                 })                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_CASE(renderTargets, index, arrayMode, {            \
-                    context.SetRenderTargetArrayMode(index, arrayMode);                   \
+                ENGINE_ARRAY_STRUCT_CASE(renderTargets, index, arrayMode, {               \
+                    context.SetColorRenderTargetArrayMode(index, arrayMode);              \
                 })                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_CASE(renderTargets, index, layerStrideLsr2, {      \
-                    context.SetRenderTargetLayerStride(index, layerStrideLsr2);           \
+                ENGINE_ARRAY_STRUCT_CASE(renderTargets, index, layerStrideLsr2, {         \
+                    context.SetColorRenderTargetLayerStride(index, layerStrideLsr2);      \
                 })                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_CASE(renderTargets, index, baseLayer, {            \
-                    context.SetRenderTargetBaseLayer(index, baseLayer);                   \
+                ENGINE_ARRAY_STRUCT_CASE(renderTargets, index, baseLayer, {               \
+                    context.SetColorRenderTargetBaseLayer(index, baseLayer);              \
                 })
 
                 BOOST_PP_REPEAT(8, RENDER_TARGET_ARRAY, 0)
                 static_assert(type::RenderTargetCount == 8 && type::RenderTargetCount < BOOST_PP_LIMIT_REPEAT);
                 #undef RENDER_TARGET_ARRAY
 
-                #define VIEWPORT_TRANSFORM_CALLBACKS(z, index, data)                                      \
-                MAXWELL3D_ARRAY_STRUCT_CASE(viewportTransforms, index, scaleX, {                          \
+                ENGINE_CASE(pointSpriteSize, {
+                    context.SetPointSpriteSize(pointSpriteSize);
+                })
+
+                ENGINE_CASE(depthTargetEnable, {
+                    context.SetDepthRenderTargetEnabled(depthTargetEnable);
+                })
+                ENGINE_STRUCT_CASE(depthTargetAddress, high, {
+                    context.SetDepthRenderTargetAddressHigh(high);
+                })
+                ENGINE_STRUCT_CASE(depthTargetAddress, low, {
+                    context.SetDepthRenderTargetAddressLow(low);
+                })
+                ENGINE_CASE(depthTargetFormat, {
+                    context.SetDepthRenderTargetFormat(depthTargetFormat);
+                })
+                ENGINE_CASE(depthTargetTileMode, {
+                    context.SetDepthRenderTargetTileMode(depthTargetTileMode);
+                })
+                ENGINE_CASE(depthTargetLayerStride, {
+                    context.SetDepthRenderTargetLayerStride(depthTargetLayerStride);
+                })
+                ENGINE_CASE(depthTargetWidth, {
+                    context.SetDepthRenderTargetWidth(depthTargetWidth);
+                })
+                ENGINE_CASE(depthTargetHeight, {
+                    context.SetDepthRenderTargetHeight(depthTargetHeight);
+                })
+                ENGINE_CASE(depthTargetArrayMode, {
+                    context.SetDepthRenderTargetArrayMode(depthTargetArrayMode);
+                })
+
+                ENGINE_CASE(linkedTscHandle, {
+                    context.SetTscIndexLinked(linkedTscHandle);
+                });
+
+                #define VIEWPORT_TRANSFORM_CALLBACKS(_z, index, data)                                     \
+                ENGINE_ARRAY_STRUCT_CASE(viewportTransforms, index, scaleX, {                             \
                     context.SetViewportX(index, scaleX, registers.viewportTransforms[index].translateX);  \
                 })                                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_CASE(viewportTransforms, index, translateX, {                      \
+                ENGINE_ARRAY_STRUCT_CASE(viewportTransforms, index, translateX, {                         \
                     context.SetViewportX(index, registers.viewportTransforms[index].scaleX, translateX);  \
                 })                                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_CASE(viewportTransforms, index, scaleY, {                          \
+                ENGINE_ARRAY_STRUCT_CASE(viewportTransforms, index, scaleY, {                             \
                     context.SetViewportY(index, scaleY, registers.viewportTransforms[index].translateY);  \
                 })                                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_CASE(viewportTransforms, index, translateY, {                      \
+                ENGINE_ARRAY_STRUCT_CASE(viewportTransforms, index, translateY, {                         \
                     context.SetViewportY(index, registers.viewportTransforms[index].scaleY, translateY);  \
                 })                                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_CASE(viewportTransforms, index, scaleZ, {                          \
+                ENGINE_ARRAY_STRUCT_CASE(viewportTransforms, index, scaleZ, {                             \
                     context.SetViewportZ(index, scaleZ, registers.viewportTransforms[index].translateZ);  \
                 })                                                                                        \
-                MAXWELL3D_ARRAY_STRUCT_CASE(viewportTransforms, index, translateZ, {                      \
+                ENGINE_ARRAY_STRUCT_CASE(viewportTransforms, index, translateZ, {                         \
                     context.SetViewportZ(index, registers.viewportTransforms[index].scaleZ, translateZ);  \
+                })                                                                                        \
+                ENGINE_ARRAY_STRUCT_CASE(viewportTransforms, index, swizzles, {                           \
+                    context.SetViewportSwizzle(index, swizzles.x, swizzles.y, swizzles.z, swizzles.w);    \
                 })
 
                 BOOST_PP_REPEAT(16, VIEWPORT_TRANSFORM_CALLBACKS, 0)
@@ -200,7 +204,7 @@ namespace skyline::soc::gm20b::engine::maxwell3d {
                 #undef VIEWPORT_TRANSFORM_CALLBACKS
 
                 #define COLOR_CLEAR_CALLBACKS(z, index, data)              \
-                MAXWELL3D_ARRAY_CASE(clearColorValue, index, {             \
+                ENGINE_ARRAY_CASE(clearColorValue, index, {                \
                     context.UpdateClearColorValue(index, clearColorValue); \
                 })
 
@@ -208,14 +212,77 @@ namespace skyline::soc::gm20b::engine::maxwell3d {
                 static_assert(4 < BOOST_PP_LIMIT_REPEAT);
                 #undef COLOR_CLEAR_CALLBACKS
 
+                ENGINE_CASE(clearDepthValue, {
+                    context.UpdateClearDepthValue(clearDepthValue);
+                })
+
+                ENGINE_CASE(clearStencilValue, {
+                    context.UpdateClearStencilValue(clearStencilValue);
+                })
+
+                ENGINE_STRUCT_CASE(polygonMode, front, {
+                    context.SetPolygonModeFront(front);
+                })
+
+                ENGINE_CASE(tessellationPatchSize, {
+                    context.SetTessellationPatchSize(tessellationPatchSize);
+                })
+
+                ENGINE_CASE(tessellationMode, {
+                    context.SetTessellationMode(tessellationMode.primitive, tessellationMode.spacing, tessellationMode.winding);
+                })
+
+                #define TRANSFORM_FEEDBACK_CALLBACKS(z, index, data)                           \
+                ENGINE_ARRAY_STRUCT_CASE(transformFeedbackBuffers, index, enable, {            \
+                    context.SetTransformFeedbackBufferEnabled(index, enable);                  \
+                })                                                                             \
+                ENGINE_ARRAY_STRUCT_STRUCT_CASE(transformFeedbackBuffers, index, iova, high, { \
+                    context.SetTransformFeedbackBufferIovaHigh(index, high);                   \
+                })                                                                             \
+                ENGINE_ARRAY_STRUCT_STRUCT_CASE(transformFeedbackBuffers, index, iova, low, {  \
+                    context.SetTransformFeedbackBufferIovaLow(index, low);                     \
+                })                                                                             \
+                ENGINE_ARRAY_STRUCT_CASE(transformFeedbackBuffers, index, size, {              \
+                    context.SetTransformFeedbackBufferSize(index, size);                       \
+                })                                                                             \
+                ENGINE_ARRAY_STRUCT_CASE(transformFeedbackBuffers, index, offset, {            \
+                    context.SetTransformFeedbackBufferOffset(index, offset);                   \
+                })                                                                             \
+                ENGINE_ARRAY_STRUCT_CASE(transformFeedbackBufferStates, index, varyingCount, { \
+                    context.SetTransformFeedbackBufferVaryingCount(index, varyingCount);       \
+                })                                                                             \
+                ENGINE_ARRAY_STRUCT_CASE(transformFeedbackBufferStates, index, stride, {       \
+                    context.SetTransformFeedbackBufferStride(index, stride);                   \
+                })
+
+                BOOST_PP_REPEAT(4, TRANSFORM_FEEDBACK_CALLBACKS, 0)
+                static_assert(type::TransformFeedbackBufferCount == 4 && type::TransformFeedbackBufferCount < BOOST_PP_LIMIT_REPEAT);
+                #undef TRANSFORM_FEEDBACK_CALLBACKS
+
+                ENGINE_CASE(transformFeedbackEnable, {
+                    context.SetTransformFeedbackEnabled(transformFeedbackEnable);
+                })
+
+                ENGINE_STRUCT_CASE(depthBiasEnable, point, {
+                    context.SetDepthBiasPointEnabled(point);
+                })
+
+                ENGINE_STRUCT_CASE(depthBiasEnable, line, {
+                    context.SetDepthBiasLineEnabled(line);
+                })
+
+                ENGINE_STRUCT_CASE(depthBiasEnable, fill, {
+                    context.SetDepthBiasFillEnabled(fill);
+                })
+
                 #define SCISSOR_CALLBACKS(z, index, data)                                                           \
-                MAXWELL3D_ARRAY_STRUCT_CASE(scissors, index, enable, {                                              \
+                ENGINE_ARRAY_STRUCT_CASE(scissors, index, enable, {                                                 \
                     context.SetScissor(index, enable ? registers.scissors[index] : std::optional<type::Scissor>{}); \
                 })                                                                                                  \
-                MAXWELL3D_ARRAY_STRUCT_CASE(scissors, index, horizontal, {                                          \
+                ENGINE_ARRAY_STRUCT_CASE(scissors, index, horizontal, {                                             \
                     context.SetScissorHorizontal(index, horizontal);                                                \
                 })                                                                                                  \
-                MAXWELL3D_ARRAY_STRUCT_CASE(scissors, index, vertical, {                                            \
+                ENGINE_ARRAY_STRUCT_CASE(scissors, index, vertical, {                                               \
                     context.SetScissorVertical(index, vertical);                                                    \
                 })
 
@@ -223,50 +290,455 @@ namespace skyline::soc::gm20b::engine::maxwell3d {
                 static_assert(type::ViewportCount == 16 && type::ViewportCount < BOOST_PP_LIMIT_REPEAT);
                 #undef SCISSOR_CALLBACKS
 
-                MAXWELL3D_CASE(renderTargetControl, {
+                ENGINE_CASE(commonColorWriteMask, {
+                    if (commonColorWriteMask) {
+                        auto colorWriteMask{registers.colorWriteMask[0]};
+                        for (u32 index{}; index != type::RenderTargetCount; index++)
+                            context.SetColorWriteMask(index, colorWriteMask);
+                    } else {
+                        for (u32 index{}; index != type::RenderTargetCount; index++)
+                            context.SetColorWriteMask(index, registers.colorWriteMask[index]);
+                    }
+                })
+
+                ENGINE_CASE(renderTargetControl, {
                     context.UpdateRenderTargetControl(renderTargetControl);
                 })
+
+                ENGINE_CASE(depthTestEnable, {
+                    context.SetDepthTestEnabled(depthTestEnable);
+                })
+
+                ENGINE_CASE(depthTestFunc, {
+                    context.SetDepthTestFunction(depthTestFunc);
+                })
+
+                ENGINE_CASE(depthWriteEnable, {
+                    context.SetDepthWriteEnabled(depthWriteEnable);
+                })
+
+                ENGINE_CASE(depthBoundsEnable, {
+                    context.SetDepthBoundsTestEnabled(depthBoundsEnable);
+                })
+
+                ENGINE_CASE(depthBoundsNear, {
+                    context.SetMinDepthBounds(depthBoundsNear);
+                })
+
+                ENGINE_CASE(depthBoundsFar, {
+                    context.SetMaxDepthBounds(depthBoundsFar);
+                })
+
+                ENGINE_CASE(stencilEnable, {
+                    context.SetStencilTestEnabled(stencilEnable);
+                })
+
+                ENGINE_STRUCT_CASE(stencilFront, failOp, {
+                    context.SetStencilFrontFailOp(failOp);
+                })
+
+                ENGINE_STRUCT_CASE(stencilFront, zFailOp, {
+                    context.SetStencilFrontDepthFailOp(zFailOp);
+                })
+
+                ENGINE_STRUCT_CASE(stencilFront, passOp, {
+                    context.SetStencilFrontPassOp(passOp);
+                })
+
+                ENGINE_STRUCT_CASE(stencilFront, compareOp, {
+                    context.SetStencilFrontCompareOp(compareOp);
+                })
+
+                ENGINE_STRUCT_CASE(stencilFront, compareReference, {
+                    context.SetStencilFrontReference(compareReference);
+                })
+
+                ENGINE_STRUCT_CASE(stencilFront, compareMask, {
+                    context.SetStencilFrontCompareMask(compareMask);
+                })
+
+                ENGINE_STRUCT_CASE(stencilFront, writeMask, {
+                    context.SetStencilFrontWriteMask(writeMask);
+                })
+
+                ENGINE_CASE(stencilTwoSideEnable, {
+                    context.SetStencilTwoSideEnabled(stencilTwoSideEnable);
+                })
+
+                ENGINE_STRUCT_CASE(stencilBack, failOp, {
+                    context.SetStencilBackFailOp(failOp);
+                })
+
+                ENGINE_STRUCT_CASE(stencilBack, zFailOp, {
+                    context.SetStencilBackDepthFailOp(zFailOp);
+                })
+
+                ENGINE_STRUCT_CASE(stencilBack, passOp, {
+                    context.SetStencilBackPassOp(passOp);
+                })
+
+                ENGINE_STRUCT_CASE(stencilBack, compareOp, {
+                    context.SetStencilBackCompareOp(compareOp);
+                })
+
+                ENGINE_STRUCT_CASE(stencilBackExtra, compareReference, {
+                    context.SetStencilBackReference(compareReference);
+                })
+
+                ENGINE_STRUCT_CASE(stencilBackExtra, compareMask, {
+                    context.SetStencilBackCompareMask(compareMask);
+                })
+
+                ENGINE_STRUCT_CASE(stencilBackExtra, writeMask, {
+                    context.SetStencilBackWriteMask(writeMask);
+                })
+
+                ENGINE_CASE(windowOriginMode, {
+                    context.SetViewportOrigin(windowOriginMode.isOriginLowerLeft);
+                    context.SetFrontFaceFlipEnabled(windowOriginMode.flipFrontFace);
+                })
+
+                ENGINE_CASE(independentBlendEnable, {
+                    context.SetIndependentBlendingEnabled(independentBlendEnable);
+                })
+
+                ENGINE_CASE(alphaTestEnable, {
+                    context.SetAlphaTestEnabled(alphaTestEnable);
+                })
+
+                #define SET_COLOR_BLEND_CONSTANT_CALLBACK(z, index, data) \
+                ENGINE_ARRAY_CASE(blendConstant, index, {                 \
+                    context.SetColorBlendConstant(index, blendConstant);  \
+                })
+
+                BOOST_PP_REPEAT(4, SET_COLOR_BLEND_CONSTANT_CALLBACK, 0)
+                static_assert(type::BlendColorChannelCount == 4 && type::BlendColorChannelCount < BOOST_PP_LIMIT_REPEAT);
+                #undef SET_COLOR_BLEND_CONSTANT_CALLBACK
+
+                ENGINE_STRUCT_CASE(blendStateCommon, colorOp, {
+                    context.SetColorBlendOp(colorOp);
+                })
+
+                ENGINE_STRUCT_CASE(blendStateCommon, colorSrcFactor, {
+                    context.SetSrcColorBlendFactor(colorSrcFactor);
+                })
+
+                ENGINE_STRUCT_CASE(blendStateCommon, colorDstFactor, {
+                    context.SetDstColorBlendFactor(colorDstFactor);
+                })
+
+                ENGINE_STRUCT_CASE(blendStateCommon, alphaOp, {
+                    context.SetAlphaBlendOp(alphaOp);
+                })
+
+                ENGINE_STRUCT_CASE(blendStateCommon, alphaSrcFactor, {
+                    context.SetSrcAlphaBlendFactor(alphaSrcFactor);
+                })
+
+                ENGINE_STRUCT_CASE(blendStateCommon, alphaDstFactor, {
+                    context.SetDstAlphaBlendFactor(alphaDstFactor);
+                })
+
+                #define SET_COLOR_BLEND_ENABLE_CALLBACK(z, index, data) \
+                ENGINE_ARRAY_CASE(rtBlendEnable, index, {               \
+                    context.SetColorBlendEnabled(index, rtBlendEnable); \
+                })
+
+                BOOST_PP_REPEAT(8, SET_COLOR_BLEND_ENABLE_CALLBACK, 0)
+                static_assert(type::RenderTargetCount == 8 && type::RenderTargetCount < BOOST_PP_LIMIT_REPEAT);
+                #undef SET_COLOR_BLEND_ENABLE_CALLBACK
+
+                ENGINE_CASE(lineWidthSmooth, {
+                    if (*registers.lineSmoothEnable)
+                        context.SetLineWidth(lineWidthSmooth);
+                })
+
+                ENGINE_CASE(lineWidthAliased, {
+                    if (!*registers.lineSmoothEnable)
+                        context.SetLineWidth(lineWidthAliased);
+                })
+
+                ENGINE_CASE(depthBiasFactor, {
+                    context.SetDepthBiasSlopeFactor(depthBiasFactor);
+                })
+
+                ENGINE_CASE(lineSmoothEnable, {
+                    context.SetLineWidth(lineSmoothEnable ? *registers.lineWidthSmooth : *registers.lineWidthAliased);
+                })
+
+                ENGINE_CASE(depthBiasUnits, {
+                    context.SetDepthBiasConstantFactor(depthBiasUnits / 2.0f);
+                })
+
+                ENGINE_STRUCT_CASE(setProgramRegion, high, {
+                    context.SetShaderBaseIovaHigh(high);
+                })
+
+                ENGINE_STRUCT_CASE(setProgramRegion, low, {
+                    context.SetShaderBaseIovaLow(low);
+                })
+
+                ENGINE_CASE(provokingVertexIsLast, {
+                    context.SetProvokingVertex(provokingVertexIsLast);
+                })
+
+                ENGINE_CASE(depthBiasClamp, {
+                    context.SetDepthBiasClamp(depthBiasClamp);
+                })
+
+                ENGINE_CASE(cullFaceEnable, {
+                    context.SetCullFaceEnabled(cullFaceEnable);
+                })
+
+                ENGINE_CASE(frontFace, {
+                    context.SetFrontFace(frontFace);
+                })
+
+                ENGINE_CASE(cullFace, {
+                    context.SetCullFace(cullFace);
+                })
+
+                #define SET_COLOR_WRITE_MASK_CALLBACK(z, index, data)              \
+                ENGINE_ARRAY_CASE(colorWriteMask, index, {                         \
+                    if (*registers.commonColorWriteMask)                           \
+                        if (index == 0)                                            \
+                            for (u32 idx{}; idx != type::RenderTargetCount; idx++) \
+                                context.SetColorWriteMask(idx, colorWriteMask);    \
+                    else                                                           \
+                        context.SetColorWriteMask(index, colorWriteMask);          \
+                })
+
+                BOOST_PP_REPEAT(8, SET_COLOR_WRITE_MASK_CALLBACK, 2)
+                static_assert(type::RenderTargetCount == 8 && type::RenderTargetCount < BOOST_PP_LIMIT_REPEAT);
+                #undef SET_COLOR_WRITE_MASK_CALLBACK
+
+                ENGINE_CASE(viewVolumeClipControl, {
+                    context.SetDepthClampEnabled(!viewVolumeClipControl.depthClampDisable);
+                })
+
+                ENGINE_STRUCT_CASE(colorLogicOp, enable, {
+                    context.SetBlendLogicOpEnable(enable);
+                })
+
+                ENGINE_STRUCT_CASE(colorLogicOp, type, {
+                    context.SetBlendLogicOpType(type);
+                })
+
+                #define VERTEX_BUFFER_CALLBACKS(z, index, data)                            \
+                ENGINE_ARRAY_STRUCT_CASE(vertexBuffers, index, config, {                   \
+                    context.SetVertexBufferStride(index, config.stride);                   \
+                })                                                                         \
+                ENGINE_ARRAY_STRUCT_STRUCT_CASE(vertexBuffers, index, iova, high, {        \
+                    context.SetVertexBufferStartIovaHigh(index, high);                     \
+                })                                                                         \
+                ENGINE_ARRAY_STRUCT_STRUCT_CASE(vertexBuffers, index, iova, low, {         \
+                    context.SetVertexBufferStartIovaLow(index, low);                       \
+                })                                                                         \
+                ENGINE_ARRAY_STRUCT_CASE(vertexBuffers, index, divisor, {                  \
+                    context.SetVertexBufferDivisor(index, divisor);                        \
+                })                                                                         \
+                ENGINE_ARRAY_CASE(isVertexInputRatePerInstance, index, {                   \
+                    context.SetVertexBufferInputRate(index, isVertexInputRatePerInstance); \
+                })                                                                         \
+                ENGINE_ARRAY_STRUCT_CASE(vertexBufferLimits, index, high, {                \
+                    context.SetVertexBufferEndIovaHigh(index, high);                       \
+                })                                                                         \
+                ENGINE_ARRAY_STRUCT_CASE(vertexBufferLimits, index, low, {                 \
+                    context.SetVertexBufferEndIovaLow(index, low);                         \
+                })
+
+                BOOST_PP_REPEAT(16, VERTEX_BUFFER_CALLBACKS, 0)
+                static_assert(type::VertexBufferCount == 16 && type::VertexBufferCount < BOOST_PP_LIMIT_REPEAT);
+                #undef VERTEX_BUFFER_CALLBACKS
+
+                #define VERTEX_ATTRIBUTES_CALLBACKS(z, index, data)               \
+                ENGINE_ARRAY_CASE(vertexAttributeState, index, {                  \
+                    context.SetVertexAttributeState(index, vertexAttributeState); \
+                })
+
+                BOOST_PP_REPEAT(32, VERTEX_ATTRIBUTES_CALLBACKS, 0)
+                static_assert(type::VertexAttributeCount == 32 && type::VertexAttributeCount < BOOST_PP_LIMIT_REPEAT);
+                #undef VERTEX_BUFFER_CALLBACKS
+
+                #define SET_INDEPENDENT_COLOR_BLEND_CALLBACKS(z, index, data)          \
+                ENGINE_ARRAY_STRUCT_CASE(independentBlend, index, colorOp, {           \
+                    context.SetColorBlendOp(index, colorOp);                           \
+                })                                                                     \
+                ENGINE_ARRAY_STRUCT_CASE(independentBlend, index, colorSrcFactor, {    \
+                    context.SetSrcColorBlendFactor(index, colorSrcFactor);             \
+                })                                                                     \
+                ENGINE_ARRAY_STRUCT_CASE(independentBlend, index, colorDstFactor, {    \
+                    context.SetDstColorBlendFactor(index, colorDstFactor);             \
+                })                                                                     \
+                ENGINE_ARRAY_STRUCT_CASE(independentBlend, index, alphaOp, {           \
+                    context.SetAlphaBlendOp(index, alphaOp);                           \
+                })                                                                     \
+                ENGINE_ARRAY_STRUCT_CASE(independentBlend, index, alphaSrcFactor, {    \
+                    context.SetSrcAlphaBlendFactor(index, alphaSrcFactor);             \
+                })                                                                     \
+                ENGINE_ARRAY_STRUCT_CASE(independentBlend, index, alphaDstFactor, {    \
+                    context.SetDstAlphaBlendFactor(index, alphaDstFactor);             \
+                })
+
+                BOOST_PP_REPEAT(8, SET_INDEPENDENT_COLOR_BLEND_CALLBACKS, 0)
+                static_assert(type::RenderTargetCount == 8 && type::RenderTargetCount < BOOST_PP_LIMIT_REPEAT);
+                #undef SET_COLOR_BLEND_ENABLE_CALLBACK
+
+                #define SET_SHADER_ENABLE_CALLBACK(z, index, data)     \
+                ENGINE_ARRAY_STRUCT_CASE(setProgram, index, info, { \
+                    context.SetShaderEnabled(info.stage, info.enable); \
+                })
+
+                BOOST_PP_REPEAT(6, SET_SHADER_ENABLE_CALLBACK, 0)
+                static_assert(type::ShaderStageCount == 6 && type::ShaderStageCount < BOOST_PP_LIMIT_REPEAT);
+                #undef SET_SHADER_ENABLE_CALLBACK
+
+                ENGINE_CASE(primitiveRestartEnable, {
+                    context.SetPrimitiveRestartEnabled(primitiveRestartEnable);
+                })
+
+                ENGINE_STRUCT_CASE(constantBufferSelector, size, {
+                    context.SetConstantBufferSelectorSize(size);
+                })
+
+                ENGINE_STRUCT_STRUCT_CASE(constantBufferSelector, address, high, {
+                    context.SetConstantBufferSelectorIovaHigh(high);
+                })
+
+                ENGINE_STRUCT_STRUCT_CASE(constantBufferSelector, address, low, {
+                    context.SetConstantBufferSelectorIovaLow(low);
+                })
+
+                ENGINE_STRUCT_STRUCT_CASE(indexBuffer, start, high, {
+                    context.SetIndexBufferStartIovaHigh(high);
+                })
+                ENGINE_STRUCT_STRUCT_CASE(indexBuffer, start, low, {
+                    context.SetIndexBufferStartIovaLow(low);
+                })
+                ENGINE_STRUCT_STRUCT_CASE(indexBuffer, limit, high, {
+                    context.SetIndexBufferEndIovaHigh(high);
+                })
+                ENGINE_STRUCT_STRUCT_CASE(indexBuffer, limit, low, {
+                    context.SetIndexBufferEndIovaLow(low);
+                })
+                ENGINE_STRUCT_CASE(indexBuffer, format, {
+                    context.SetIndexBufferFormat(format);
+                })
+
+                ENGINE_CASE(bindlessTextureConstantBufferIndex, {
+                    context.SetBindlessTextureConstantBufferIndex(bindlessTextureConstantBufferIndex);
+                })
+
+                ENGINE_STRUCT_STRUCT_CASE(samplerPool, address, high, {
+                    context.SetSamplerPoolIovaHigh(high);
+                })
+                ENGINE_STRUCT_STRUCT_CASE(samplerPool, address, low, {
+                    context.SetSamplerPoolIovaLow(low);
+                })
+                ENGINE_STRUCT_CASE(samplerPool, maximumIndex, {
+                    context.SetSamplerPoolMaximumIndex(maximumIndex);
+                })
+
+                ENGINE_STRUCT_STRUCT_CASE(texturePool, address, high, {
+                    context.SetTexturePoolIovaHigh(high);
+                })
+                ENGINE_STRUCT_STRUCT_CASE(texturePool, address, low, {
+                    context.SetTexturePoolIovaLow(low);
+                })
+                ENGINE_STRUCT_CASE(texturePool, maximumIndex, {
+                    context.SetTexturePoolMaximumIndex(maximumIndex);
+                })
+                ENGINE_CASE(depthMode, {
+                    context.SetDepthMode(depthMode);
+                })
+
+                #define TRANSFORM_FEEDBACK_VARYINGS_CALLBACK(z, index, data)                                               \
+                ENGINE_ARRAY_CASE(transformFeedbackVaryings, index, {                                                      \
+                    context.SetTransformFeedbackBufferVarying(index / (type::TransformFeedbackVaryingCount / sizeof(u32)), \
+                                                              index % (type::TransformFeedbackVaryingCount / sizeof(u32)), \
+                                                              transformFeedbackVaryings);                                  \
+                })
+
+                BOOST_PP_REPEAT(128, TRANSFORM_FEEDBACK_VARYINGS_CALLBACK, 0)
+                static_assert((type::TransformFeedbackVaryingCount / sizeof(u32)) * type::TransformFeedbackBufferCount < BOOST_PP_LIMIT_REPEAT);
+                #undef TRANSFORM_FEEDBACK_VARYINGS_CALLBACK
+
+                default:
+                    break;
             }
         }
 
         switch (method) {
-            MAXWELL3D_STRUCT_CASE(mme, instructionRamLoad, {
-                if (registers.mme->instructionRamPointer >= macroCode.size())
+            ENGINE_STRUCT_CASE(mme, instructionRamLoad, {
+                if (registers.mme->instructionRamPointer >= macroState.macroCode.size())
                     throw exception("Macro memory is full!");
 
-                macroCode[registers.mme->instructionRamPointer++] = instructionRamLoad;
+                macroState.macroCode[registers.mme->instructionRamPointer++] = instructionRamLoad;
 
                 // Wraparound writes
-                registers.mme->instructionRamPointer %= macroCode.size();
+                // This works on HW but will also generate an error interrupt
+                registers.mme->instructionRamPointer %= macroState.macroCode.size();
             })
 
-            MAXWELL3D_STRUCT_CASE(mme, startAddressRamLoad, {
-                if (registers.mme->startAddressRamPointer >= macroPositions.size())
+            ENGINE_STRUCT_CASE(mme, startAddressRamLoad, {
+                if (registers.mme->startAddressRamPointer >= macroState.macroPositions.size())
                     throw exception("Maximum amount of macros reached!");
 
-                macroPositions[registers.mme->startAddressRamPointer++] = startAddressRamLoad;
+                macroState.macroPositions[registers.mme->startAddressRamPointer++] = startAddressRamLoad;
             })
 
-            MAXWELL3D_CASE(syncpointAction, {
+            ENGINE_STRUCT_CASE(i2m, launchDma, {
+                i2m.LaunchDma(*registers.i2m);
+            })
+
+            ENGINE_STRUCT_CASE(i2m, loadInlineData, {
+                i2m.LoadInlineData(*registers.i2m, loadInlineData);
+            })
+
+            ENGINE_CASE(syncpointAction, {
                 Logger::Debug("Increment syncpoint: {}", static_cast<u16>(syncpointAction.id));
-                channelCtx.executor.Execute();
-                state.soc->host1x.syncpoints.at(syncpointAction.id).Increment();
+                channelCtx.executor.Submit();
+                syncpoints.at(syncpointAction.id).Increment();
             })
 
-            MAXWELL3D_CASE(clearBuffers, {
+            ENGINE_CASE(clearBuffers, {
                 context.ClearBuffers(clearBuffers);
             })
 
-            MAXWELL3D_STRUCT_CASE(semaphore, info, {
+            ENGINE_CASE(vertexBeginGl, {
+                context.SetPrimitiveTopology(vertexBeginGl.topology);
+
+                // If we reach here then we aren't in a deferred draw so theres no need to flush anything
+                if (vertexBeginGl.instanceNext)
+                    deferredDraw.instanceCount++;
+                else if (vertexBeginGl.instanceContinue)
+                    deferredDraw.instanceCount = 1;
+            })
+
+            ENGINE_CASE(drawVertexCount, {
+                // Defer the draw until the first non-draw operation to allow for detecting instanced draws (see DeferredDrawState comment)
+                deferredDraw.Set(drawVertexCount, *registers.drawVertexFirst, 0, registers.vertexBeginGl->topology, false);
+            })
+
+            ENGINE_CASE(drawIndexCount, {
+                // Defer the draw until the first non-draw operation to allow for detecting instanced draws (see DeferredDrawState comment)
+                deferredDraw.Set(drawIndexCount, *registers.drawIndexFirst, *registers.drawBaseVertex, registers.vertexBeginGl->topology, true);
+            })
+
+            ENGINE_STRUCT_CASE(semaphore, info, {
+                if (info.reductionEnable)
+                    Logger::Warn("Semaphore reduction is unimplemented!");
+
                 switch (info.op) {
                     case type::SemaphoreInfo::Op::Release:
+                        channelCtx.executor.Submit();
                         WriteSemaphoreResult(registers.semaphore->payload);
                         break;
 
                     case type::SemaphoreInfo::Op::Counter: {
                         switch (info.counterType) {
                             case type::SemaphoreInfo::CounterType::Zero:
-                                WriteSemaphoreResult(0);
+                                WriteSemaphoreResult(registers.semaphore->payload);
                                 break;
 
                             default:
@@ -282,51 +754,98 @@ namespace skyline::soc::gm20b::engine::maxwell3d {
                 }
             })
 
-            MAXWELL3D_ARRAY_CASE(firmwareCall, 4, {
+            #define SHADER_CALLBACKS(z, index, data)                                        \
+                ENGINE_ARRAY_STRUCT_CASE(setProgram, index, offset, {                       \
+                    context.SetShaderOffset(static_cast<type::ShaderStage>(index), offset); \
+                })
+
+            BOOST_PP_REPEAT(6, SHADER_CALLBACKS, 0)
+            static_assert(type::ShaderStageCount == 6 && type::ShaderStageCount < BOOST_PP_LIMIT_REPEAT);
+            #undef SHADER_CALLBACKS
+
+            #define PIPELINE_CALLBACKS(z, idx, data)                                                                                       \
+                ENGINE_ARRAY_STRUCT_CASE(bind, idx, constantBuffer, {                                                                      \
+                    context.BindPipelineConstantBuffer(static_cast<type::PipelineStage>(idx), constantBuffer.valid, constantBuffer.index); \
+                })
+
+            BOOST_PP_REPEAT(5, PIPELINE_CALLBACKS, 0)
+            static_assert(type::PipelineStageCount == 5 && type::PipelineStageCount < BOOST_PP_LIMIT_REPEAT);
+            #undef PIPELINE_CALLBACKS
+
+            ENGINE_ARRAY_CASE(firmwareCall, 4, {
                 registers.raw[0xD00] = 1;
             })
+
+            // Begin a batch constant buffer update, this case will never be reached if a batch update is currently active
+            #define CBUF_UPDATE_CALLBACKS(z, index, data_)                                      \
+            ENGINE_STRUCT_ARRAY_CASE(constantBufferUpdate, data, index, {                       \
+                batchConstantBufferUpdate.startOffset = registers.constantBufferUpdate->offset; \
+                batchConstantBufferUpdate.buffer.push_back(data);                               \
+                registers.constantBufferUpdate->offset += 4;                                    \
+            })
+
+            BOOST_PP_REPEAT(16, CBUF_UPDATE_CALLBACKS, 0)
+            #undef CBUF_UPDATE_CALLBACKS
 
             default:
                 break;
         }
-
-        #undef MAXWELL3D_OFFSET
-        #undef MAXWELL3D_STRUCT_OFFSET
-        #undef MAXWELL3D_ARRAY_OFFSET
-        #undef MAXWELL3D_ARRAY_STRUCT_OFFSET
-        #undef MAXWELL3D_ARRAY_STRUCT_STRUCT_OFFSET
-
-        #undef MAXWELL3D_CASE_BASE
-        #undef MAXWELL3D_CASE
-        #undef MAXWELL3D_STRUCT_CASE
-        #undef MAXWELL3D_ARRAY_CASE
-        #undef MAXWELL3D_ARRAY_STRUCT_CASE
-        #undef MAXWELL3D_ARRAY_STRUCT_STRUCT_CASE
     }
 
     void Maxwell3D::WriteSemaphoreResult(u64 result) {
-        struct FourWordResult {
-            u64 value;
-            u64 timestamp;
-        };
+        u64 address{registers.semaphore->address};
 
         switch (registers.semaphore->info.structureSize) {
             case type::SemaphoreInfo::StructureSize::OneWord:
-                channelCtx.asCtx->gmmu.Write<u32>(registers.semaphore->address.Pack(), static_cast<u32>(result));
+                channelCtx.asCtx->gmmu.Write(address, static_cast<u32>(result));
+                Logger::Debug("address: 0x{:X} payload: {}", address, result);
                 break;
 
             case type::SemaphoreInfo::StructureSize::FourWords: {
-                // Convert the current nanosecond time to GPU ticks
-                constexpr i64 NsToTickNumerator{384};
-                constexpr i64 NsToTickDenominator{625};
+                // Write timestamp first to ensure correct ordering
+                u64 timestamp{GetGpuTimeTicks()};
+                channelCtx.asCtx->gmmu.Write(address + 8, timestamp);
+                channelCtx.asCtx->gmmu.Write(address, result);
+                Logger::Debug("address: 0x{:X} payload: {} timestamp: {}", address, result, timestamp);
 
-                i64 nsTime{util::GetTimeNs()};
-                i64 timestamp{(nsTime / NsToTickDenominator) * NsToTickNumerator + ((nsTime % NsToTickDenominator) * NsToTickNumerator) / NsToTickDenominator};
-
-                channelCtx.asCtx->gmmu.Write<FourWordResult>(registers.semaphore->address.Pack(),
-                                                             FourWordResult{result, static_cast<u64>(timestamp)});
                 break;
             }
         }
+    }
+
+    void Maxwell3D::FlushEngineState() {
+        FlushDeferredDraw();
+
+        if (batchConstantBufferUpdate.Active()) {
+            context.ConstantBufferUpdate(batchConstantBufferUpdate.buffer, batchConstantBufferUpdate.Invalidate());
+            batchConstantBufferUpdate.Reset();
+        }
+    }
+
+    __attribute__((always_inline)) void Maxwell3D::CallMethod(u32 method, u32 argument) {
+        Logger::Verbose("Called method in Maxwell 3D: 0x{:X} args: 0x{:X}", method, argument);
+
+        HandleMethod(method, argument);
+    }
+
+    void Maxwell3D::CallMethodBatchNonInc(u32 method, span<u32> arguments) {
+        switch (method) {
+            case ENGINE_STRUCT_OFFSET(i2m, loadInlineData):
+                i2m.LoadInlineData(*registers.i2m, arguments);
+                return;
+            default:
+                break;
+        }
+
+        for (u32 argument : arguments)
+            HandleMethod(method, argument);
+    }
+
+    void Maxwell3D::CallMethodFromMacro(u32 method, u32 argument) {
+        HandleMethod(method, argument);
+    }
+
+    u32 Maxwell3D::ReadMethodFromMacro(u32 method) {
+        return registers.raw[method];
     }
 }

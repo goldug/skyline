@@ -3,13 +3,22 @@
 
 #pragma once
 
+#include <algorithm>
 #include <random>
 #include <span>
 #include <frozen/unordered_map.h>
 #include <frozen/string.h>
+#include <xxhash.h>
 #include "base.h"
+#include "exception.h"
 
 namespace skyline::util {
+    /**
+     * @brief Concept for any trivial non-container type
+     */
+    template<typename T>
+    concept TrivialObject = std::is_trivially_copyable_v<T> && !requires(T v) { v.data(); };
+
     /**
      * @brief Returns the current time in nanoseconds
      * @return The current time in nanoseconds
@@ -18,7 +27,7 @@ namespace skyline::util {
         u64 frequency;
         asm("MRS %0, CNTFRQ_EL0" : "=r"(frequency));
         u64 ticks;
-        asm("MRS %0, CNTVCT_EL0" : "=r"(ticks));
+        asm volatile("MRS %0, CNTVCT_EL0" : "=r"(ticks));
         return static_cast<i64>(((ticks / frequency) * constant::NsInSecond) + (((ticks % frequency) * constant::NsInSecond + (frequency / 2)) / frequency));
     }
 
@@ -28,7 +37,7 @@ namespace skyline::util {
      */
     inline u64 GetTimeTicks() {
         u64 ticks;
-        asm("MRS %0, CNTVCT_EL0" : "=r"(ticks));
+        asm volatile("MRS %0, CNTVCT_EL0" : "=r"(ticks));
         return ticks;
     }
 
@@ -61,7 +70,7 @@ namespace skyline::util {
 
     /**
      * @return The value aligned up to the next multiple
-     * @note The multiple needs to be a power of 2
+     * @note The multiple **must** be a power of 2
      */
     template<typename TypeVal>
     requires IsPointerOrUnsignedIntegral<TypeVal>
@@ -71,8 +80,19 @@ namespace skyline::util {
     }
 
     /**
+     * @return The value aligned up to the next multiple, the multiple is not restricted to being a power of two (NPOT)
+     * @note This will round away from zero for negative numbers
+     * @note This is costlier to compute than the power of 2 version, it should be preferred over this when possible
+     */
+    template<typename TypeVal>
+    requires std::is_integral_v<TypeVal> || std::is_pointer_v<TypeVal>
+    constexpr TypeVal AlignUpNpot(TypeVal value, ssize_t multiple) {
+        return ValuePointer<TypeVal>(((PointerValue(value) + multiple - 1) / multiple) * multiple);
+    }
+
+    /**
      * @return The value aligned down to the previous multiple
-     * @note The multiple needs to be a power of 2
+     * @note The multiple **must** be a power of 2
      */
     template<typename TypeVal>
     requires IsPointerOrUnsignedIntegral<TypeVal>
@@ -102,6 +122,15 @@ namespace skyline::util {
     requires IsPointerOrUnsignedIntegral<TypeVal>
     constexpr bool IsWordAligned(TypeVal value) {
         return IsAligned(value, WORD_BIT / 8);
+    }
+
+    /**
+     * @return The value of division rounded up to the next integral
+     */
+    template<typename Type>
+    requires std::is_integral_v<Type>
+    constexpr Type DivideCeil(Type dividend, Type divisor) {
+        return (dividend + divisor - 1) / divisor;
     }
 
     /**
@@ -191,6 +220,16 @@ namespace skyline::util {
     }
 
     /**
+     * @brief A fast hash for any trivial object that is designed to be utilized with hash-based containers
+     */
+    template<typename T> requires std::is_trivial_v<T>
+    struct ObjectHash {
+        size_t operator()(const T &object) const noexcept {
+            return XXH64(&object, sizeof(object), 0);
+        }
+    };
+
+    /**
      * @brief Selects the largest possible integer type for representing an object alongside providing the size of the object in terms of the underlying type
      */
     template<class T>
@@ -215,12 +254,11 @@ namespace skyline::util {
     template<typename T>
     requires std::is_integral_v<T>
     void FillRandomBytes(std::span<T> in) {
-        std::independent_bits_engine<std::mt19937_64, std::numeric_limits<T>::digits, T> gen(detail::generator);
-        std::generate(in.begin(), in.end(), gen);
+        std::uniform_int_distribution<u64> dist(std::numeric_limits<T>::min(), std::numeric_limits<T>::max());
+        std::generate(in.begin(), in.end(), [&]() { return dist(detail::generator); });
     }
 
-    template<class T>
-    requires (!std::is_integral_v<T> && std::is_trivially_copyable_v<T>)
+    template<TrivialObject T>
     void FillRandomBytes(T &object) {
         FillRandomBytes(std::span(reinterpret_cast<typename IntegerFor<T>::Type *>(&object), IntegerFor<T>::Count));
     }
@@ -263,8 +301,7 @@ namespace skyline::util {
     };
 
     template<typename T, typename... TArgs, size_t... Is>
-    std::array<T, sizeof...(Is)> MakeFilledArray(std::index_sequence<Is...>, TArgs &&... args)
-    {
+    std::array<T, sizeof...(Is)> MakeFilledArray(std::index_sequence<Is...>, TArgs &&... args) {
         return {(void(Is), T(args...))...};
     }
 

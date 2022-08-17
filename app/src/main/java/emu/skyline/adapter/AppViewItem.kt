@@ -84,7 +84,8 @@ private typealias InteractionFunction = (appItem : AppItem) -> Unit
 class AppViewItem(var layoutType : LayoutType, private val item : AppItem, private val missingIcon : Bitmap, private val onClick : InteractionFunction, private val onLongClick : InteractionFunction) : GenericListItem<LayoutBinding<*>>() {
     override fun getViewBindingFactory() = LayoutBindingFactory(layoutType)
 
-    override fun bind(binding : LayoutBinding<*>, position : Int) {
+    override fun bind(holder : GenericViewHolder<LayoutBinding<*>>, position : Int) {
+        val binding = holder.binding
         binding.textTitle.text = item.title
         binding.textSubtitle.text = item.subTitle ?: item.loaderResultString(binding.root.context)
 
@@ -94,10 +95,13 @@ class AppViewItem(var layoutType : LayoutType, private val item : AppItem, priva
             binding.icon.setOnClickListener { showIconDialog(it.context, item) }
         }
 
-        binding.root.findViewById<View>(R.id.item_click_layout).apply {
-            setOnClickListener { onClick.invoke(item) }
-            setOnLongClickListener { true.also { onLongClick.invoke(item) } }
+        val handleClicks = { view : View ->
+            view.setOnClickListener { onClick.invoke(item) }
+            view.setOnLongClickListener { true.also { onLongClick.invoke(item) } }
         }
+
+        handleClicks(binding.root.findViewById(R.id.item_click_layout))
+        binding.root.findViewById<View>(R.id.item_card)?.let { handleClicks(it) }
     }
 
     private fun showIconDialog(context : Context, appItem : AppItem) {

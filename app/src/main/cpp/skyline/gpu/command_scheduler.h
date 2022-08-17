@@ -4,6 +4,7 @@
 #pragma once
 
 #include <common/thread_local.h>
+#include <common/circular_queue.h>
 #include "fence_cycle.h"
 
 namespace skyline::gpu {
@@ -23,45 +24,9 @@ namespace skyline::gpu {
             std::shared_ptr<FenceCycle> cycle; //!< The latest cycle on the fence, all waits must be performed through this
 
             CommandBufferSlot(vk::raii::Device &device, vk::CommandBuffer commandBuffer, vk::raii::CommandPool &pool);
-
-            /**
-             * @brief Attempts to allocate the buffer if it is free (Not being recorded/executing)
-             * @return If the allocation was successful or not
-             */
-            static bool AllocateIfFree(CommandBufferSlot &slot);
         };
 
-        /**
-         * @brief An active command buffer occupies a slot and ensures that its status is updated correctly
-         */
-        class ActiveCommandBuffer {
-          private:
-            CommandBufferSlot &slot;
-
-          public:
-            constexpr ActiveCommandBuffer(CommandBufferSlot &slot) : slot(slot) {}
-
-            ~ActiveCommandBuffer() {
-                slot.active.clear(std::memory_order_release);
-            }
-
-            vk::Fence GetFence() {
-                return *slot.fence;
-            }
-
-            std::shared_ptr<FenceCycle> GetFenceCycle() {
-                return slot.cycle;
-            }
-
-            vk::raii::CommandBuffer &operator*() {
-                return slot.commandBuffer;
-            }
-
-            vk::raii::CommandBuffer *operator->() {
-                return &slot.commandBuffer;
-            }
-        };
-
+        const DeviceState &state;
         GPU &gpu;
 
         /**
@@ -77,18 +42,79 @@ namespace skyline::gpu {
         };
         ThreadLocal<CommandPool> pool;
 
+        std::thread waiterThread; //!< A thread that waits on and signals FenceCycle(s) then clears any associated resources
+        static constexpr size_t FenceCycleWaitCount{256}; //!< The amount of fence cycles the cycle queue can hold
+        CircularQueue<std::shared_ptr<FenceCycle>> cycleQueue{FenceCycleWaitCount}; //!< A circular queue containing all the active cycles that can be waited on
+
+        void WaiterThread();
+
+      public:
+        /**
+         * @brief An active command buffer occupies a slot and ensures that its status is updated correctly
+         */
+        class ActiveCommandBuffer {
+          private:
+            CommandBufferSlot *slot;
+
+          public:
+            constexpr ActiveCommandBuffer(CommandBufferSlot &slot) : slot{&slot} {}
+
+            constexpr ActiveCommandBuffer &operator=(ActiveCommandBuffer &&other) {
+                if (slot)
+                    slot->active.clear(std::memory_order_release);
+                slot = other.slot;
+                other.slot = nullptr;
+                return *this;
+            }
+
+            ~ActiveCommandBuffer() {
+                if (slot)
+                    slot->active.clear(std::memory_order_release);
+            }
+
+            vk::Fence GetFence() {
+                return *slot->fence;
+            }
+
+            std::shared_ptr<FenceCycle> GetFenceCycle() {
+                return slot->cycle;
+            }
+
+            vk::raii::CommandBuffer &operator*() {
+                return slot->commandBuffer;
+            }
+
+            vk::raii::CommandBuffer *operator->() {
+                return &slot->commandBuffer;
+            }
+
+            /**
+             * @brief Resets the state of the command buffer with a new FenceCycle
+             * @note This should be used when a single allocated command buffer is used for all submissions from a component
+             */
+            std::shared_ptr<FenceCycle> Reset() {
+                slot->cycle->Wait();
+                slot->cycle = std::make_shared<FenceCycle>(slot->device, *slot->fence);
+                slot->commandBuffer.reset();
+                return slot->cycle;
+            }
+        };
+
+        CommandScheduler(const DeviceState &state, GPU &gpu);
+
+        ~CommandScheduler();
+
         /**
          * @brief Allocates an existing or new primary command buffer from the pool
          */
         ActiveCommandBuffer AllocateCommandBuffer();
 
         /**
-         * @brief Submits a single command buffer to the GPU queue with an optional fence
+         * @brief Submits a single command buffer to the GPU queue while queuing it up to be waited on
+         * @note The supplied command buffer and cycle **must** be from AllocateCommandBuffer()
+         * @note Any cycle submitted via this method does not need to destroy dependencies manually, the waiter thread will handle this
          */
-        void SubmitCommandBuffer(const vk::raii::CommandBuffer &commandBuffer, vk::Fence fence = {});
-
-      public:
-        CommandScheduler(GPU &gpu);
+        void SubmitCommandBuffer(const vk::raii::CommandBuffer &commandBuffer, const std::shared_ptr<FenceCycle> &cycle);
 
         /**
          * @brief Submits a command buffer recorded with the supplied function synchronously
@@ -102,8 +128,10 @@ namespace skyline::gpu {
                 });
                 recordFunction(*commandBuffer);
                 commandBuffer->end();
-                SubmitCommandBuffer(*commandBuffer, commandBuffer.GetFence());
-                return commandBuffer.GetFenceCycle();
+
+                auto cycle{commandBuffer.GetFenceCycle()};
+                SubmitCommandBuffer(*commandBuffer, cycle);
+                return cycle;
             } catch (...) {
                 commandBuffer.GetFenceCycle()->Cancel();
                 std::rethrow_exception(std::current_exception());
@@ -116,14 +144,16 @@ namespace skyline::gpu {
         template<typename RecordFunction>
         std::shared_ptr<FenceCycle> SubmitWithCycle(RecordFunction recordFunction) {
             auto commandBuffer{AllocateCommandBuffer()};
+            auto cycle{commandBuffer.GetFenceCycle()};
             try {
                 commandBuffer->begin(vk::CommandBufferBeginInfo{
                     .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
                 });
-                recordFunction(*commandBuffer, commandBuffer.GetFenceCycle());
+                recordFunction(*commandBuffer, cycle);
                 commandBuffer->end();
-                SubmitCommandBuffer(*commandBuffer, commandBuffer.GetFence());
-                return commandBuffer.GetFenceCycle();
+
+                SubmitCommandBuffer(*commandBuffer, cycle);
+                return cycle;
             } catch (...) {
                 commandBuffer.GetFenceCycle()->Cancel();
                 std::rethrow_exception(std::current_exception());

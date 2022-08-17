@@ -5,7 +5,7 @@
 
 namespace skyline::audio {
     Audio::Audio(const DeviceState &state) : oboe::AudioStreamCallback() {
-        builder.setChannelCount(constant::ChannelCount);
+        builder.setChannelCount(constant::StereoChannelCount);
         builder.setSampleRate(constant::SampleRate);
         builder.setFormat(constant::PcmFormat);
         builder.setFramesPerCallback(constant::MixBufferSize);
@@ -23,7 +23,7 @@ namespace skyline::audio {
     }
 
     std::shared_ptr<AudioTrack> Audio::OpenTrack(u8 channelCount, u32 sampleRate, const std::function<void()> &releaseCallback) {
-        std::lock_guard trackGuard(trackLock);
+        std::scoped_lock trackGuard{trackLock};
 
         auto track{std::make_shared<AudioTrack>(channelCount, sampleRate, releaseCallback)};
         audioTracks.push_back(track);
@@ -32,10 +32,9 @@ namespace skyline::audio {
     }
 
     void Audio::CloseTrack(std::shared_ptr<AudioTrack> &track) {
-        std::lock_guard trackGuard(trackLock);
+        std::scoped_lock trackGuard{trackLock};
 
         audioTracks.erase(std::remove(audioTracks.begin(), audioTracks.end(), track), audioTracks.end());
-        track.reset();
     }
 
     oboe::DataCallbackResult Audio::onAudioReady(oboe::AudioStream *audioStream, void *audioData, int32_t numFrames) {
@@ -44,13 +43,13 @@ namespace skyline::audio {
         size_t writtenSamples{};
 
         {
-            std::lock_guard trackGuard(trackLock);
+            std::scoped_lock trackGuard{trackLock};
 
             for (auto &track : audioTracks) {
                 if (track->playbackState == AudioOutState::Stopped)
                     continue;
 
-                std::lock_guard bufferGuard(track->bufferLock);
+                std::scoped_lock bufferGuard{track->bufferLock};
 
                 auto trackSamples{track->samples.Read(span(destBuffer, streamSamples), [](i16 *source, i16 *destination) {
                     *destination = Saturate<i16, i32>(static_cast<u32>(*destination) + static_cast<u32>(*source));
